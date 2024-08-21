@@ -1,14 +1,16 @@
 use std::{
-    alloc::{alloc, Layout},
+    alloc::{alloc, realloc, Layout},
     ptr::NonNull,
 };
 
+#[allow(dead_code)]
 struct Vector<T> {
     len: usize,
     capacity: usize,
     ptr: NonNull<T>,
 }
 
+#[allow(dead_code)]
 impl<T> Vector<T> {
     pub fn new() -> Self {
         Self {
@@ -30,7 +32,26 @@ impl<T> Vector<T> {
                 self.capacity = 4;
                 self.len = 1;
             }
-            _ if self.len >= self.capacity => todo!(),
+            _ if self.len >= self.capacity => {
+                let new_capacity = self
+                    .capacity
+                    .checked_mul(2)
+                    .expect("Could not allocate memory.");
+                let size = std::mem::size_of::<T>() * self.capacity();
+                let align = std::mem::align_of::<T>();
+                size.checked_add(size % align)
+                    .expect("Could not allocate memory.");
+                unsafe {
+                    let layout = Layout::from_size_align_unchecked(size, align);
+                    let new_size = std::mem::size_of::<T>() * new_capacity;
+                    let ptr = realloc(self.ptr.as_ptr() as *mut u8, layout, new_size);
+                    let ptr = NonNull::new(ptr as *mut T).expect("Could not allocate memory");
+                    ptr.as_ptr().add(self.len).write(item);
+                    self.ptr = ptr;
+                    self.len += 1;
+                    self.capacity = new_capacity;
+                }
+            }
             _ => {
                 let offset = self
                     .len
@@ -69,5 +90,9 @@ mod tests {
         v.push(23 as usize);
         assert_eq!(v.len(), 4);
         assert_eq!(v.capacity(), 4);
+        v.push(28 as usize);
+        assert_eq!(v.len(), 5);
+        assert_eq!(v.capacity(), 8);
+        // v[2] = 2;
     }
 }
