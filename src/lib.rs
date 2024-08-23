@@ -1,68 +1,86 @@
 use std::{
-    alloc::{alloc, realloc, Layout},
-    ptr::NonNull,
+    alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout},
+    mem,
+    ops::{Deref, DerefMut},
+    ptr::{read, write, NonNull},
 };
 
 #[allow(dead_code)]
 struct Vector<T> {
+    ptr: NonNull<T>,
     len: usize,
     capacity: usize,
-    ptr: NonNull<T>,
 }
 
 #[allow(dead_code)]
 impl<T> Vector<T> {
     pub fn new() -> Self {
+        assert!(
+            mem::size_of::<T>() != 0,
+            "Cannot allocate memory for zero sized types"
+        );
         Self {
             ptr: NonNull::dangling(),
-            len: 0,
-            capacity: 0,
+            len: 0usize,
+            capacity: 0usize,
         }
     }
 
-    pub fn push(&mut self, item: T) {
-        assert_ne!(std::mem::size_of::<T>(), 0, "No zero sized types");
-        match self.capacity() {
-            0 => {
-                let layout = Layout::array::<T>(4).expect("Could not allocated memory");
-                let ptr = unsafe { alloc(layout) } as *mut T;
-                let ptr = NonNull::new(ptr).expect("Could not allocate memory");
-                unsafe { ptr.as_ptr().write(item) };
-                self.ptr = ptr;
-                self.capacity = 4;
-                self.len = 1;
-            }
-            _ if self.len >= self.capacity => {
-                let new_capacity = self
-                    .capacity
-                    .checked_mul(2)
-                    .expect("Could not allocate memory.");
-                let size = std::mem::size_of::<T>() * self.capacity();
-                let align = std::mem::align_of::<T>();
-                size.checked_add(size % align)
-                    .expect("Could not allocate memory.");
-                unsafe {
-                    let layout = Layout::from_size_align_unchecked(size, align);
-                    let new_size = std::mem::size_of::<T>() * new_capacity;
-                    let ptr = realloc(self.ptr.as_ptr() as *mut u8, layout, new_size);
-                    let ptr = NonNull::new(ptr as *mut T).expect("Could not allocate memory");
-                    ptr.as_ptr().add(self.len).write(item);
-                    self.ptr = ptr;
-                    self.len += 1;
-                    self.capacity = new_capacity;
-                }
-            }
-            _ => {
-                let offset = self
-                    .len
-                    .checked_mul(std::mem::size_of::<T>())
-                    .expect("Cannot allocate memory.");
-                assert!(offset < isize::MAX as usize, "Wrapped isize");
-                unsafe {
-                    self.ptr.as_ptr().add(self.len).write(item);
-                    self.len += 1;
-                }
-            }
+    fn grow(&mut self) {
+        let (new_cap, new_layout) = if self.capacity == 0 {
+            (1, Layout::array::<T>(1).unwrap())
+        } else {
+            // This can't overflow since self.cap <= isize::MAX.
+            let new_cap = 2 * self.capacity;
+
+            // `Layout::array` checks that the number of bytes is <= usize::MAX,
+            // but this is redundant since old_layout.size() <= isize::MAX,
+            // so the `unwrap` should never fail.
+            let new_layout = Layout::array::<T>(new_cap).unwrap();
+            (new_cap, new_layout)
+        };
+
+        // Ensure that the new allocation doesn't exceed `isize::MAX` bytes.
+        assert!(
+            new_layout.size() <= isize::MAX as usize,
+            "Allocation too large"
+        );
+
+        let new_ptr = if self.capacity == 0 {
+            unsafe { alloc(new_layout) }
+        } else {
+            let old_layout = Layout::array::<T>(self.capacity).unwrap();
+            let old_ptr = self.ptr.as_ptr() as *mut u8;
+            unsafe { realloc(old_ptr, old_layout, new_layout.size()) }
+        };
+
+        // If allocation fails, `new_ptr` will be null, in which case we abort.
+        self.ptr = match NonNull::new(new_ptr as *mut T) {
+            Some(p) => p,
+            None => handle_alloc_error(new_layout),
+        };
+        self.capacity = new_cap;
+    }
+
+    pub fn push(&mut self, elem: T) {
+        if self.len == self.capacity {
+            self.grow();
+        }
+
+        unsafe {
+            write(self.ptr.as_ptr().add(self.len), elem);
+        }
+
+        // Can't fail, we'll OOM first.
+        self.len += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            unsafe { Some(read(self.ptr.as_ptr().add(self.len))) }
         }
     }
 
@@ -74,6 +92,34 @@ impl<T> Vector<T> {
         self.len
     }
 }
+
+impl<T> Drop for Vector<T> {
+    fn drop(&mut self) {
+        if self.capacity != 0 {
+            while let Some(_) = self.pop() {}
+            let layout = Layout::array::<T>(self.capacity).unwrap();
+            unsafe {
+                dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            }
+        }
+    }
+}
+
+impl<T> Deref for Vector<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl<T> DerefMut for Vector<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+unsafe impl<T: Send> Send for Vector<T> {}
+unsafe impl<T: Sync> Sync for Vector<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -93,6 +139,6 @@ mod tests {
         v.push(28 as usize);
         assert_eq!(v.len(), 5);
         assert_eq!(v.capacity(), 8);
-        // v[2] = 2;
+        v[2] = 20;
     }
 }
