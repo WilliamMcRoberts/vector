@@ -2,7 +2,7 @@ use std::{
     alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout},
     mem,
     ops::{Deref, DerefMut},
-    ptr::{read, write, NonNull},
+    ptr::{copy, read, write, NonNull},
 };
 
 #[allow(dead_code)]
@@ -82,6 +82,27 @@ impl<T> Vector<T> {
             self.len -= 1;
             unsafe { Some(read(self.ptr.as_ptr().add(self.len))) }
         }
+    }
+
+    pub fn insert(&mut self, index: usize, elem: T) {
+        // Note: `<=` because it's valid to insert after everything
+        // which would be equivalent to push.
+        assert!(index <= self.len, "index out of bounds");
+        if self.len == self.capacity {
+            self.grow();
+        }
+
+        unsafe {
+            // ptr::copy(src, dest, len): "copy from src to dest len elems"
+            copy(
+                self.ptr.as_ptr().add(index),
+                self.ptr.as_ptr().add(index + 1),
+                self.len - index,
+            );
+            write(self.ptr.as_ptr().add(index), elem);
+        }
+
+        self.len += 1;
     }
 
     pub fn capacity(&self) -> usize {
