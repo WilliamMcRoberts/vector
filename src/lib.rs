@@ -1,11 +1,14 @@
 use std::{
     alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout},
-    mem::{self},
+    marker::PhantomData,
+    mem::{forget, size_of},
     ops::{Deref, DerefMut},
     ptr::{copy, read, write, NonNull},
 };
 
-#[allow(dead_code)]
+//////////////// Vector /////////////////////////////////
+/////////////////////////////////////////////////////////
+
 struct Vector<T> {
     buf: RawVec<T>,
     len: usize,
@@ -71,6 +74,20 @@ impl<T> Vector<T> {
         }
     }
 
+    pub fn drain(&mut self) -> Drain<T> {
+        let iter = unsafe { RawValIter::new(&self) };
+
+        // this is a mem::forget safety thing. If Drain is forgotten, we just
+        // leak the whole Vector's contents. Also we need to do this *eventually*
+        // anyway, so why not do it now?
+        self.len = 0;
+
+        Drain {
+            iter,
+            vec: PhantomData,
+        }
+    }
+
     fn ptr(&self) -> *mut T {
         self.buf.ptr.as_ptr()
     }
@@ -87,11 +104,46 @@ impl<T> Vector<T> {
     }
 }
 
-#[allow(dead_code)]
+impl<T> Deref for Vector<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.len) }
+    }
+}
+
+impl<T> DerefMut for Vector<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.len) }
+    }
+}
+
+impl<T> IntoIterator for Vector<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+    fn into_iter(self) -> IntoIter<T> {
+        unsafe {
+            let iter = RawValIter::new(&self);
+
+            let buf = read(&self.buf);
+            forget(self);
+
+            IntoIter { iter, _buf: buf }
+        }
+    }
+}
+
+//////////////// RawVec /////////////////////////////////
+/////////////////////////////////////////////////////////
+
+pub struct RawVec<T> {
+    ptr: NonNull<T>,
+    capacity: usize,
+}
+
 impl<T> RawVec<T> {
     pub fn new() -> Self {
         assert!(
-            mem::size_of::<T>() != 0,
+            size_of::<T>() != 0,
             "Cannot allocate memory for zero sized types"
         );
         Self {
@@ -101,7 +153,8 @@ impl<T> RawVec<T> {
     }
 
     fn grow(&mut self) {
-        let (new_cap, new_layout) = if self.capacity == 0 {
+        let cur_cap_is_zero = || self.capacity == 0;
+        let (new_cap, new_layout) = if cur_cap_is_zero() {
             (1, Layout::array::<T>(1).unwrap())
         } else {
             // This can't overflow since self.cap <= isize::MAX.
@@ -120,7 +173,7 @@ impl<T> RawVec<T> {
             "Allocation too large"
         );
 
-        let new_ptr = if self.capacity == 0 {
+        let new_ptr = if cur_cap_is_zero() {
             unsafe { alloc(new_layout) }
         } else {
             let old_layout = Layout::array::<T>(self.capacity).unwrap();
@@ -137,6 +190,9 @@ impl<T> RawVec<T> {
     }
 }
 
+unsafe impl<T: Send> Send for RawVec<T> {}
+unsafe impl<T: Sync> Sync for RawVec<T> {}
+
 impl<T> Drop for RawVec<T> {
     fn drop(&mut self) {
         if self.capacity != 0 {
@@ -148,97 +204,138 @@ impl<T> Drop for RawVec<T> {
     }
 }
 
-impl<T> Deref for Vector<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr(), self.len) }
-    }
-}
+//////////////// IntoIter /////////////////////////////////
+/////////////////////////////////////////////////////////
 
-impl<T> DerefMut for Vector<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.len) }
-    }
-}
-
-pub struct RawVec<T> {
-    ptr: NonNull<T>,
-    capacity: usize,
-}
-
-#[allow(dead_code)]
 pub struct IntoIter<T> {
     _buf: RawVec<T>, // we don't actually care about this. Just need it to live.
+    iter: RawValIter<T>,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        self.iter.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<T> DoubleEndedIterator for IntoIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        self.iter.next_back()
+    }
+}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        for _ in &mut *self {}
+    }
+}
+
+//////////////// Drain /////////////////////////////////
+/////////////////////////////////////////////////////////
+
+pub struct Drain<'a, T: 'a> {
+    vec: PhantomData<&'a mut Vector<T>>,
+    iter: RawValIter<T>,
+}
+
+impl<'a, T> Iterator for Drain<'a, T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        self.iter.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for Drain<'a, T> {
+    fn next_back(&mut self) -> Option<T> {
+        self.iter.next_back()
+    }
+}
+
+impl<'a, T> Drop for Drain<'a, T> {
+    fn drop(&mut self) {
+        for _ in &mut *self {}
+    }
+}
+
+//////////////// RawValIter /////////////////////////////////
+/////////////////////////////////////////////////////////
+
+struct RawValIter<T> {
     start: *const T,
     end: *const T,
 }
 
-impl<T> IntoIterator for Vector<T> {
-    type Item = T;
-    type IntoIter = IntoIter<T>;
-    fn into_iter(self) -> IntoIter<T> {
-        // need to use ptr::read to unsafely move the buf out since it's
-        // not Copy, and Vec implements Drop (so we can't destructure it).
-        let buf = unsafe { read(&self.buf) };
-        let len = self.len;
-        mem::forget(self);
-
-        IntoIter {
-            start: buf.ptr.as_ptr(),
-            end: if buf.capacity == 0 {
-                // can't offset off of a pointer unless it's part of an allocation
-                buf.ptr.as_ptr()
+impl<T> RawValIter<T> {
+    // unsafe to construct because it has no associated lifetimes.
+    // This is necessary to store a RawValIter in the same struct as
+    // its actual allocation. OK since it's a private implementation
+    // detail.
+    unsafe fn new(slice: &[T]) -> Self {
+        RawValIter {
+            start: slice.as_ptr(),
+            end: if slice.len() == 0 {
+                // if `len = 0`, then this is not actually allocated memory.
+                // Need to avoid offsetting because that will give wrong
+                // information to LLVM via GEP.
+                slice.as_ptr()
             } else {
-                unsafe { buf.ptr.as_ptr().add(len) }
+                slice.as_ptr().add(slice.len())
             },
-            _buf: buf,
         }
     }
 }
 
-impl<T> Iterator for IntoIter<T> {
+impl<T> DoubleEndedIterator for RawValIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.start == self.end {
+            None
+        } else {
+            unsafe {
+                if size_of::<T>() == 0 {
+                    self.end = (self.end as usize - 1) as *const _;
+                    Some(read(NonNull::<T>::dangling().as_ptr()))
+                } else {
+                    self.end = self.end.offset(-1);
+                    Some(read(self.end))
+                }
+            }
+        }
+    }
+}
+
+impl<T> Iterator for RawValIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         if self.start == self.end {
             None
         } else {
             unsafe {
-                let result = read(self.start);
-                self.start = self.start.offset(1);
-                Some(result)
+                if size_of::<T>() == 0 {
+                    self.start = (self.start as usize + 1) as *const _;
+                    Some(read(NonNull::<T>::dangling().as_ptr()))
+                } else {
+                    let old_ptr = self.start;
+                    self.start = self.start.offset(1);
+                    Some(read(old_ptr))
+                }
             }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = (self.end as usize - self.start as usize) / mem::size_of::<T>();
+        let elem_size = size_of::<T>();
+        let len =
+            (self.end as usize - self.start as usize) / if elem_size == 0 { 1 } else { elem_size };
         (len, Some(len))
     }
 }
-
-impl<T> DoubleEndedIterator for IntoIter<T> {
-    fn next_back(&mut self) -> Option<T> {
-        if self.start == self.end {
-            None
-        } else {
-            unsafe {
-                self.end = self.end.offset(-1);
-                Some(read(self.end))
-            }
-        }
-    }
-}
-
-impl<T> Drop for IntoIter<T> {
-    fn drop(&mut self) {
-        // only need to ensure all our elements are read;
-        // buffer will clean itself up afterwards.
-        for _ in &mut *self {}
-    }
-}
-
-unsafe impl<T: Send> Send for RawVec<T> {}
-unsafe impl<T: Sync> Sync for RawVec<T> {}
 
 #[cfg(test)]
 mod tests {
